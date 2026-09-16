@@ -10,6 +10,11 @@ load_dotenv()
 api_key = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
 client = Groq(api_key=api_key)
 
+MODEL = "openai/gpt-oss-120b"
+
+VALID_CATEGORIES = ["Productive", "Learning", "Necessary", "Leisure", "Unproductive", "Unknown"]
+REQUIRED_COLUMNS = ["date", "activity", "duration_minutes", "category", "interpretation"]
+
 st.set_page_config(page_title="Time Detective AI", layout="wide")
 
 st.markdown("""
@@ -39,6 +44,13 @@ def format_duration(minutes):
         return f"{m}m"
 
 
+def data_fingerprint(dataframe):
+    """A stable signature of the current activity data, used to detect staleness."""
+    if dataframe.empty:
+        return "empty"
+    return str(dataframe.sort_values(by=["date", "activity"]).to_dict(orient="records"))
+
+
 CATEGORY_COLORS = {
     "Productive": "#2ecc71",
     "Learning": "#16a085",
@@ -54,6 +66,8 @@ if "manual_entries" not in st.session_state:
     st.session_state.manual_entries = []
 if "categorized_df" not in st.session_state:
     st.session_state.categorized_df = None
+if "analyzed_fingerprint" not in st.session_state:
+    st.session_state.analyzed_fingerprint = None
 if "show_demo_data" not in st.session_state:
     st.session_state.show_demo_data = True
 
@@ -61,7 +75,7 @@ st.divider()
 st.subheader("📋 Your Activity")
 st.caption("Showing a demo dataset below. Add your own activities anytime, on top of it, or remove the demo entirely.")
 
-with st.expander("➕ Add your own activity"):
+with st.expander("➕ Add your own activity", expanded=bool(st.session_state.manual_entries)):
     with st.form("manual_entry_form", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -74,10 +88,23 @@ with st.expander("➕ Add your own activity"):
         if submitted and entry_activity:
             st.session_state.manual_entries.append({
                 "date": str(entry_date),
-                "activity": entry_activity,
-                "duration_minutes": entry_duration
+                "activity": entry_activity.strip(),
+                "duration_minutes": int(entry_duration)
             })
             st.success(f"Added {entry_activity}")
+
+    if st.session_state.manual_entries:
+        st.markdown("**Your added activities:**")
+        for i, entry in enumerate(st.session_state.manual_entries):
+            row_col1, row_col2, row_col3 = st.columns([3, 2, 1])
+            with row_col1:
+                st.write(f"{entry['activity']}")
+            with row_col2:
+                st.write(f"{entry['date']} · {entry['duration_minutes']} min")
+            with row_col3:
+                if st.button("🗑️", key=f"delete_manual_{i}", help="Remove this activity"):
+                    st.session_state.manual_entries.pop(i)
+                    st.rerun()
 
 col_a, col_b = st.columns([5, 1])
 with col_b:
@@ -97,6 +124,9 @@ if st.session_state.manual_entries:
     df = pd.concat([active_base_df, manual_df], ignore_index=True)
 else:
     df = active_base_df
+
+if not df.empty:
+    df["duration_minutes"] = pd.to_numeric(df["duration_minutes"], errors="coerce").fillna(0).astype(int)
 
 if df.empty:
     st.info("No activity data yet. Add your own above, or restore the demo data.")
@@ -122,33 +152,63 @@ Use these reasoning patterns to make your best judgment call, don't default to U
 - Only use "Unknown" for genuinely unrecognizable or nonsense activity names, not common apps you can reason about.
 - Give a short one-sentence interpretation for each entry explaining your reasoning.
 
+Return exactly one object per input entry, {len(activity_list)} in total, preserving the same order.
+
 Activity data:
 {json.dumps(activity_list)}
 
 Respond ONLY with valid JSON, a list of objects, each with keys: date, activity, duration_minutes, category, interpretation. No other text, no markdown formatting."""
 
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model=MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3
     )
 
     raw = response.choices[0].message.content.strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
-    return pd.DataFrame(json.loads(raw))
+    result = pd.DataFrame(json.loads(raw))
+
+    # Validate the AI actually returned what we asked for
+    missing = [c for c in REQUIRED_COLUMNS if c not in result.columns]
+    if missing:
+        raise ValueError(f"The AI's response was missing these fields: {', '.join(missing)}")
+
+    if result.empty:
+        raise ValueError("The AI returned no results.")
+
+    # Force durations to be real numbers, never strings
+    result["duration_minutes"] = pd.to_numeric(result["duration_minutes"], errors="coerce").fillna(0).astype(int)
+
+    # Anything outside our known categories becomes Unknown so the user can clarify it
+    result.loc[~result["category"].isin(VALID_CATEGORIES), "category"] = "Unknown"
+
+    return result
 
 
 st.divider()
 if st.button("🔍 Analyze My Time", type="primary", help="Let the AI figure out what your time was actually spent on"):
-    with st.spinner("Understanding where your time actually went..."):
-        try:
-            st.session_state.categorized_df = categorize_activities(df)
-            st.session_state.pop("why_analysis", None)
-            st.session_state.pop("what_if_answer", None)
-        except json.JSONDecodeError:
-            st.error("Something went wrong reading the AI's response. Try clicking Analyze again.")
+    if df.empty:
+        st.warning("There's no activity data to analyze yet. Add an activity or restore the demo data first.")
+    else:
+        with st.spinner("Understanding where your time actually went..."):
+            try:
+                st.session_state.categorized_df = categorize_activities(df)
+                st.session_state.analyzed_fingerprint = data_fingerprint(df)
+                st.session_state.pop("why_analysis", None)
+                st.session_state.pop("what_if_answer", None)
+            except json.JSONDecodeError:
+                st.error("The AI's response wasn't readable. Try clicking Analyze again.")
+            except ValueError as e:
+                st.error(f"{e} Try clicking Analyze again.")
+            except Exception as e:
+                st.error(f"Analysis failed. Try again in a moment. ({e})")
 
 if st.session_state.categorized_df is not None:
+    # Warn if the underlying data changed since the last analysis
+    if st.session_state.analyzed_fingerprint != data_fingerprint(df):
+        st.warning("Your activity data has changed since this analysis was run. Click **Analyze My Time** again to update the results below.")
+
     st.subheader("🗂️ Categorized Activity")
     display_cat = st.session_state.categorized_df.copy()
     display_cat["duration_minutes"] = display_cat["duration_minutes"].apply(format_duration)
@@ -181,7 +241,7 @@ if st.session_state.categorized_df is not None:
     st.divider()
     st.subheader("📊 Insights Dashboard")
 
-    total_minutes = cat_df["duration_minutes"].sum()
+    total_minutes = int(cat_df["duration_minutes"].sum())
     col1, col2 = st.columns(2)
 
     with col1:
@@ -198,7 +258,7 @@ if st.session_state.categorized_df is not None:
                 .sort_values(ascending=False)
         if not leak.empty:
             biggest_leak = leak.index[0]
-            biggest_leak_time = leak.iloc[0]
+            biggest_leak_time = int(leak.iloc[0])
             st.metric("Biggest time leak", biggest_leak, f"{biggest_leak_time} min")
         else:
             st.write("No clear time leak detected yet.")
@@ -231,7 +291,7 @@ Write a short analysis (4-6 sentences) that:
 Write directly to the user as "you." Be specific and grounded in the actual numbers given, don't make up patterns the data doesn't support."""
 
                 why_response = client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
+                    model=MODEL,
                     messages=[{"role": "user", "content": why_prompt}],
                     temperature=0.4
                 )
@@ -263,7 +323,7 @@ The user's hypothetical question: "{what_if_question}"
 Using the real numbers above, estimate the time impact of this change. Show your math briefly (e.g. "X minutes/day average, over {days_tracked} days tracked, projected to Y hours/week or Z hours/month"). Be honest that this is an estimate based on limited tracked data, not a guarantee. Keep it to 3-4 sentences, direct and specific, no generic advice."""
 
                 what_if_response = client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
+                    model=MODEL,
                     messages=[{"role": "user", "content": what_if_prompt}],
                     temperature=0.4
                 )
