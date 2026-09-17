@@ -52,12 +52,12 @@ def data_fingerprint(dataframe):
 
 
 CATEGORY_COLORS = {
-    "Productive": "#2ecc71",
-    "Learning": "#16a085",
-    "Necessary": "#f1c40f",
-    "Leisure": "#3498db",
-    "Unproductive": "#e74c3c",
-    "Unknown": "#95a5a6"
+    "Productive": "#0072B2",
+    "Learning": "#009E73",
+    "Necessary": "#F0E442",
+    "Leisure": "#56B4E9",
+    "Unproductive": "#D05C03",
+    "Unknown": "#999999"
 }
 
 base_df = pd.read_csv("data/sample_activity.csv")
@@ -249,8 +249,15 @@ if st.session_state.categorized_df is not None:
         fig = px.pie(summary, values="duration_minutes", names="category",
                      title=f"Total tracked: {total_minutes // 60}h {total_minutes % 60}m",
                      color="category",
-                     color_discrete_map=CATEGORY_COLORS)
+                     color_discrete_map=CATEGORY_COLORS,
+                     labels={"duration_minutes": "Duration (minutes)", "category": "Category"})
         st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("📄 View as text (screen reader friendly)"):
+            summary_sorted = summary.sort_values("duration_minutes", ascending=False)
+            for _, row in summary_sorted.iterrows():
+                pct = (row["duration_minutes"] / total_minutes * 100) if total_minutes else 0
+                st.write(f"**{row['category']}**: {format_duration(row['duration_minutes'])} ({pct:.0f}% of total)")
 
     with col2:
         leak = cat_df[cat_df["category"].isin(["Unproductive", "Leisure"])] \
@@ -264,8 +271,13 @@ if st.session_state.categorized_df is not None:
             st.write("No clear time leak detected yet.")
 
         by_activity = cat_df.groupby("activity")["duration_minutes"].sum().sort_values(ascending=False).reset_index()
-        fig2 = px.bar(by_activity, x="activity", y="duration_minutes", title="Time by activity")
+        fig2 = px.bar(by_activity, x="activity", y="duration_minutes", title="Time by activity",
+                      labels={"duration_minutes": "Duration (minutes)", "activity": "Activity"})
         st.plotly_chart(fig2, use_container_width=True)
+
+        with st.expander("📄 View as text (screen reader friendly)"):
+            for _, row in by_activity.iterrows():
+                st.write(f"**{row['activity']}**: {format_duration(row['duration_minutes'])}")
 
     st.divider()
     st.subheader("🤔 Why Am I Losing Time?")
@@ -306,8 +318,7 @@ Write directly to the user as "you." Be specific and grounded in the actual numb
     st.subheader("💭 What If I Changed Something?")
     st.caption("Ask a hypothetical, get a real estimate based on your tracked data.")
 
-    what_if_question = st.text_input("e.g. 'What if I stop using Instagram during study hours?'")
-
+    what_if_question = st.text_input("Your hypothetical question", placeholder="e.g. What if I stop using Instagram during study hours?")
     if st.button("Estimate impact", help="See a real projection based on your actual averages") and what_if_question:
         with st.spinner("Running the numbers..."):
             try:
